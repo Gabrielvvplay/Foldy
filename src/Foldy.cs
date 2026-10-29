@@ -5,6 +5,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Net;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -22,7 +23,7 @@ using Accessibility;
 using Microsoft.Win32;
 
 [assembly: AssemblyTitle("Foldy")]
-[assembly: AssemblyVersion("1.0.0.0")]
+[assembly: AssemblyVersion("1.1.0.0")]
 
 namespace Foldy
 {
@@ -92,6 +93,9 @@ namespace Foldy
             if (File.Exists(DesktopLnk(name)) || NameTakenOnDesktop(name))
                 return "Já tem um item chamado \"" + name + "\" na área de trabalho. Escolha outro nome.";
             Directory.CreateDirectory(FolderPath(name));
+            // Pasta nova já nasce com a transparência geral escolhida no painel.
+            int icon = Config.IconTransparency, card = Config.CardTransparency;
+            if (icon > 0 || card > 0) new FolderStyle { IconTransparency = icon, CardTransparency = card }.Save(name);
             UpdateDesktop(name);
             return null;
         }
@@ -601,6 +605,51 @@ namespace Foldy
             return track;
         }
 
+        // Controle deslizante no tema escuro (o Slider padrão do WPF é claro). "refresh" redesenha
+        // a partir de get(), pra quando o valor muda por fora (ex.: "Restaurar padrão").
+        public static FrameworkElement MakeSlider(Func<double> get, Action<double> set, double max, out Action refresh, Action released = null)
+        {
+            const double knobSize = 18;
+            var track = new Border { Height = 6, CornerRadius = new CornerRadius(3), Background = new SolidColorBrush(Color.FromArgb(60, 255, 255, 255)) };
+            var fill = new Border { Height = 6, CornerRadius = new CornerRadius(3), Background = Accent, HorizontalAlignment = HorizontalAlignment.Left };
+            var knob = new Border
+            {
+                Width = knobSize, Height = knobSize, CornerRadius = new CornerRadius(knobSize / 2), Background = Brushes.White, HorizontalAlignment = HorizontalAlignment.Left,
+                Effect = new DropShadowEffect { BlurRadius = 6, ShadowDepth = 1, Opacity = 0.4, Color = Colors.Black },
+            };
+            var grid = new Grid { Height = 26, Background = Brushes.Transparent, Cursor = Cursors.Hand };
+            grid.Children.Add(track);
+            grid.Children.Add(fill);
+            grid.Children.Add(knob);
+            Action layout = () =>
+            {
+                double w = grid.ActualWidth - knobSize;
+                if (w <= 0) return;
+                double x = w * get() / max;
+                fill.Width = x + knobSize / 2;
+                knob.Margin = new Thickness(x, 0, 0, 0);
+            };
+            MouseEventHandler drag = (s, e) =>
+            {
+                if (!grid.IsMouseCaptured) return;
+                double w = grid.ActualWidth - knobSize;
+                double x = e.GetPosition(grid).X - knobSize / 2;
+                set(Math.Round(Math.Max(0, Math.Min(max, x / w * max))));
+                layout();
+            };
+            grid.SizeChanged += delegate { layout(); };
+            grid.MouseLeftButtonDown += (s, e) => { e.Handled = true; grid.CaptureMouse(); drag(s, e); };
+            grid.MouseMove += drag;
+            grid.MouseLeftButtonUp += delegate
+            {
+                if (!grid.IsMouseCaptured) return;
+                grid.ReleaseMouseCapture();
+                if (released != null) released();
+            };
+            refresh = layout;
+            return grid;
+        }
+
         public static MenuItem MenuItem(string header, Action action)
         {
             var mi = new MenuItem { Header = header };
@@ -690,6 +739,9 @@ namespace Foldy
         public int Columns;                  // colunas no popup; 0 = automático
         public int IconSize = 52;
         public bool SortByName;
+        public const int MaxTransparency = 90; // em 100% o fundo some e os cliques passariam direto pra área de trabalho
+        public int IconTransparency;           // % de transparência do fundo do ícone na área de trabalho
+        public int CardTransparency;           // % de transparência do fundo do popup
 
         static string FileOf(string name) { return Path.Combine(Store.FolderPath(name), ".estilo"); }
 
@@ -715,6 +767,9 @@ namespace Foldy
                         case "colunas": if (n >= 0 && n <= 6) s.Columns = n; break;
                         case "icones": if (n >= 32 && n <= 96) s.IconSize = n; break;
                         case "ordem": s.SortByName = v == "nome"; break;
+                        case "transparencia": s.IconTransparency = s.CardTransparency = Math.Max(0, Math.Min(MaxTransparency, n)); break; // versão com um controle só
+                        case "transparencia_icone": s.IconTransparency = Math.Max(0, Math.Min(MaxTransparency, n)); break;
+                        case "transparencia_pasta": s.CardTransparency = Math.Max(0, Math.Min(MaxTransparency, n)); break;
                     }
                 }
             }
@@ -734,6 +789,8 @@ namespace Foldy
                 "colunas=" + Columns,
                 "icones=" + IconSize,
                 "ordem=" + (SortByName ? "nome" : "entrada"),
+                "transparencia_icone=" + IconTransparency,
+                "transparencia_pasta=" + CardTransparency,
             });
             File.SetAttributes(f, FileAttributes.Hidden);
         }
@@ -745,12 +802,15 @@ namespace Foldy
             return Color.FromRgb((byte)(a.R + (b.R - a.R) * t), (byte)(a.G + (b.G - a.G) * t), (byte)(a.B + (b.B - a.B) * t));
         }
 
+        static byte Alpha(int opaque, int transparency) { return (byte)(opaque * (100 - transparency) / 100); }
+
         public Brush IconBackground
         {
             get
             {
                 Color dark = Mix(Colors.Black, Tint, 0.5);
-                return new LinearGradientBrush(Color.FromArgb(225, Tint.R, Tint.G, Tint.B), Color.FromArgb(225, dark.R, dark.G, dark.B), 90);
+                byte a = Alpha(225, IconTransparency);
+                return new LinearGradientBrush(Color.FromArgb(a, Tint.R, Tint.G, Tint.B), Color.FromArgb(a, dark.R, dark.G, dark.B), 90);
             }
         }
 
@@ -759,9 +819,9 @@ namespace Foldy
         {
             get
             {
-                if (Tint == DefaultTint) return Theme.Card;
-                Color m = Mix(Color.FromRgb(30, 30, 36), Tint, 0.28);
-                return new SolidColorBrush(Color.FromArgb(238, m.R, m.G, m.B));
+                if (Tint == DefaultTint && CardTransparency == 0) return Theme.Card;
+                Color m = Tint == DefaultTint ? Color.FromRgb(30, 30, 36) : Mix(Color.FromRgb(30, 30, 36), Tint, 0.28);
+                return new SolidColorBrush(Color.FromArgb(Alpha(238, CardTransparency), m.R, m.G, m.B));
             }
         }
     }
@@ -784,6 +844,7 @@ namespace Foldy
         readonly Image preview;
         readonly List<Action> refreshers = new List<Action>();
         readonly List<string> items;
+        Action<FolderStyle> livePreview; // aplica o estilo no popup aberto enquanto mexe, pra ver contra o papel de parede
 
         public CustomizeDialog(string folder, FolderStyle current)
         {
@@ -815,6 +876,9 @@ namespace Foldy
 
             stack.Children.Add(Label("Cor"));
             stack.Children.Add(Swatches());
+            stack.Children.Add(Label("Transparência do fundo"));
+            stack.Children.Add(TransparencySlider("Ícone", () => Result.IconTransparency, v => Result.IconTransparency = v));
+            stack.Children.Add(TransparencySlider("Pasta aberta", () => Result.CardTransparency, v => Result.CardTransparency = v));
             stack.Children.Add(Choice("Formato do ícone", new[] { "Arredondado", "Círculo", "Quadrado" }, new[] { "arredondado", "circulo", "quadrado" },
                 () => Result.Shape, v => Result.Shape = v));
             stack.Children.Add(Choice("Apps no ícone", new[] { "4 (2×2)", "9 (3×3)" }, new[] { 2, 3 },
@@ -857,11 +921,23 @@ namespace Foldy
         }
 
         // Abre a janela e aplica o que foi salvo (nome, estilo e ícone da área de trabalho).
-        // Retorna o nome final da pasta, ou null se nada mudou.
-        public static string Edit(Window owner, string name, Action<string> message)
+        // Retorna o nome final da pasta, ou null se nada mudou. Com livePreview, a janela abre
+        // ao lado do popup (e não em cima dele) e o popup acompanha as mudanças na hora.
+        public static string Edit(Window owner, string name, Action<string> message, Action<FolderStyle> livePreview = null)
         {
-            var d = new CustomizeDialog(name, FolderStyle.Load(name)) { Owner = owner, WindowStartupLocation = WindowStartupLocation.CenterOwner };
-            if (d.ShowDialog() != true) return null;
+            FolderStyle original = FolderStyle.Load(name);
+            var d = new CustomizeDialog(name, original) { Owner = owner, WindowStartupLocation = WindowStartupLocation.CenterOwner };
+            if (livePreview != null)
+            {
+                d.livePreview = livePreview;
+                d.WindowStartupLocation = WindowStartupLocation.Manual;
+                d.Loaded += delegate { d.PlaceBeside(owner); };
+            }
+            if (d.ShowDialog() != true)
+            {
+                if (livePreview != null) livePreview(original);
+                return null;
+            }
             string n = Store.CleanName(d.NewName);
             if (n != "" && n != name)
             {
@@ -883,6 +959,33 @@ namespace Foldy
                 : items.OrderBy(p => File.GetCreationTimeUtc(p)).ToList();
             List<BitmapSource> icons = order.Take(Result.Preview * Result.Preview).Select(p => IconUtil.Get(p)).Where(b => b != null).ToList();
             preview.Source = IconUtil.RenderFolder(icons, 192, Result);
+            if (livePreview != null) livePreview(Result);
+        }
+
+        // À direita do popup; se não couber, à esquerda. Sempre dentro da tela.
+        void PlaceBeside(Window owner)
+        {
+            Rect wa = SystemParameters.WorkArea;
+            double right = owner.Left + owner.ActualWidth - 20, left = owner.Left + 20 - ActualWidth;
+            Left = right + ActualWidth <= wa.Right ? right : Math.Max(wa.Left, left);
+            Top = Math.Max(wa.Top, Math.Min(owner.Top, wa.Bottom - ActualHeight));
+        }
+
+        UIElement TransparencySlider(string label, Func<int> get, Action<int> set)
+        {
+            var name = new TextBlock { Text = label, Foreground = Theme.Text, FontSize = 12.5, Width = 92, VerticalAlignment = VerticalAlignment.Center };
+            var value = new TextBlock { Foreground = Theme.Muted, FontSize = 12, Width = 40, TextAlignment = TextAlignment.Right, VerticalAlignment = VerticalAlignment.Center };
+            Action redraw;
+            FrameworkElement slider = Theme.MakeSlider(() => get(), v => { set((int)v); Refresh(); }, FolderStyle.MaxTransparency, out redraw);
+            refreshers.Add(redraw);
+            refreshers.Add(() => value.Text = get() + "%");
+            var row = new DockPanel { Margin = new Thickness(2, 0, 0, 2) };
+            DockPanel.SetDock(name, Dock.Left);
+            DockPanel.SetDock(value, Dock.Right);
+            row.Children.Add(name);
+            row.Children.Add(value);
+            row.Children.Add(slider);
+            return row;
         }
 
         static TextBlock Label(string text)
@@ -1352,7 +1455,7 @@ namespace Foldy
         void Customize()
         {
             suppress = true;
-            string n = CustomizeDialog.Edit(this, name, text => Theme.Message(this, text));
+            string n = CustomizeDialog.Edit(this, name, text => Theme.Message(this, text), s => card.Background = s.CardBackground);
             suppress = false;
             Activate();
             if (n == null) return;
@@ -1532,6 +1635,8 @@ namespace Foldy
 
         readonly Dictionary<string, string> signatures = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         readonly DispatcherTimer debounce = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(150) };
+        readonly DispatcherTimer updates = new DispatcherTimer { Interval = TimeSpan.FromMinutes(2) }; // a primeira procura espera o PC terminar de ligar
+        Updater.Release pending;
         FileSystemWatcher watcher, desktopWatcher;
         HwndSource mailbox;
         ClickWatcher clicks;
@@ -1571,7 +1676,41 @@ namespace Foldy
             clicks = new ClickWatcher(() => d.BeginInvoke(new Action(OnClick)));
             clicks.Start();
 
+            Updater.CleanupOld();
+            updates.Tick += delegate { updates.Interval = TimeSpan.FromHours(6); CheckForUpdate(); };
+            updates.Start();
+
             Sync();
+        }
+
+        void CheckForUpdate()
+        {
+            if (!Config.AutoUpdate || !Installer.IsInstalledCopy) return;
+            if (pending != null) { TryApplyUpdate(); return; }
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                try
+                {
+                    Updater.Release r = Updater.Check();
+                    if (r == null) return;
+                    Updater.Download(r);
+                    Log.Write("Versão " + r.Version.ToString(2) + " baixada.");
+                    Application.Current.Dispatcher.BeginInvoke(new Action(() => { pending = r; TryApplyUpdate(); }));
+                }
+                catch (Exception ex) { Log.Write("Procurando atualização: " + ex.Message); }
+            });
+        }
+
+        // Só troca de versão com nenhuma pasta nem o painel abertos, pra nada sumir da frente da pessoa.
+        void TryApplyUpdate()
+        {
+            if ((popup != null && popup.IsVisible) || Native.FindWindow(null, ControlPanel.WindowTitle) != IntPtr.Zero)
+            {
+                updates.Interval = TimeSpan.FromMinutes(1);
+                return;
+            }
+            try { Updater.Apply(null); }
+            catch (Exception ex) { Log.Write("Aplicando atualização: " + ex); pending = null; }
         }
 
         void Kick()
@@ -1679,6 +1818,31 @@ namespace Foldy
         {
             get { return Get("umclique") != "0"; }
             set { Set("umclique", value ? "1" : "0"); }
+        }
+
+        public static bool AutoUpdate
+        {
+            get { return Get("atualizar") != "0"; }
+            set { Set("atualizar", value ? "1" : "0"); }
+        }
+
+        // Última transparência aplicada a todas as pastas pelo painel (e a que as pastas novas recebem).
+        public static int IconTransparency
+        {
+            get { return GetInt("transparencia_icone"); }
+            set { Set("transparencia_icone", value.ToString()); }
+        }
+
+        public static int CardTransparency
+        {
+            get { return GetInt("transparencia_pasta"); }
+            set { Set("transparencia_pasta", value.ToString()); }
+        }
+
+        static int GetInt(string key)
+        {
+            int n;
+            return int.TryParse(Get(key), out n) ? Math.Max(0, Math.Min(FolderStyle.MaxTransparency, n)) : 0;
         }
 
         static Dictionary<string, string> Load()
@@ -1852,6 +2016,70 @@ namespace Foldy
                 return p.ExitCode;
             }
         }
+    }
+
+    // Procura versão nova nos Releases do GitHub e troca o .exe instalado por ela.
+    static class Updater
+    {
+        const string LatestRelease = "https://api.github.com/repos/Gabrielvvplay/Foldy/releases/latest";
+        static string OldExe { get { return Path.Combine(Store.Root, "Foldy.old.exe"); } }
+        static string NewExe { get { return Path.Combine(Store.Root, "Foldy.new.exe"); } }
+
+        public class Release { public Version Version; public string Url; }
+
+        public static Version Current { get { return Normalize(Assembly.GetExecutingAssembly().GetName().Version); } }
+
+        static Version Normalize(Version v) { return new Version(v.Major, v.Minor, Math.Max(0, v.Build), Math.Max(0, v.Revision)); }
+
+        static WebClient Client()
+        {
+            ServicePointManager.SecurityProtocol |= SecurityProtocolType.Tls12; // o GitHub não aceita as versões antigas do TLS
+            var web = new WebClient { Encoding = Encoding.UTF8 };
+            web.Headers[HttpRequestHeader.UserAgent] = "Foldy"; // a API do GitHub recusa pedidos sem isso
+            return web;
+        }
+
+        // A versão mais nova publicada, ou null se esta já é a mais nova.
+        public static Release Check()
+        {
+            string json;
+            using (WebClient web = Client()) json = web.DownloadString(LatestRelease);
+            var tag = System.Text.RegularExpressions.Regex.Match(json, "\"tag_name\"\\s*:\\s*\"v?([0-9]+(\\.[0-9]+){1,3})\"");
+            var url = System.Text.RegularExpressions.Regex.Match(json, "\"browser_download_url\"\\s*:\\s*\"([^\"]+/Foldy\\.exe)\"");
+            if (!tag.Success || !url.Success) return null;
+            Version v = Normalize(new Version(tag.Groups[1].Value));
+            return v > Current ? new Release { Version = v, Url = url.Groups[1].Value } : null;
+        }
+
+        // Baixa e confere se o arquivo é mesmo o Foldy da versão anunciada.
+        public static void Download(Release r)
+        {
+            try { File.Delete(NewExe); } catch { }
+            using (WebClient web = Client()) web.DownloadFile(r.Url, NewExe);
+            AssemblyName got = AssemblyName.GetAssemblyName(NewExe);
+            if (got.Name != "Foldy" || Normalize(got.Version) != r.Version)
+            {
+                File.Delete(NewExe);
+                throw new InvalidDataException("o arquivo baixado não é o Foldy " + r.Version.ToString(2) + ".");
+            }
+        }
+
+        // Troca o .exe instalado pelo baixado (um .exe em uso pode ser renomeado, só não sobrescrito),
+        // reinstala com ele e fecha este processo. "thenArgs" abre a versão nova em seguida (ex.: o painel).
+        public static void Apply(string thenArgs)
+        {
+            CleanupOld();
+            Installer.StopOthers();
+            File.Move(Store.InstalledExe, OldExe);
+            try { File.Move(NewExe, Store.InstalledExe); }
+            catch { File.Move(OldExe, Store.InstalledExe); throw; }
+            Log.Write("Atualizando da versão " + Current.ToString(2) + ".");
+            Process.Start(Store.InstalledExe, "--instalar");
+            if (thenArgs != null) Process.Start(Store.InstalledExe, thenArgs);
+            Application.Current.Shutdown();
+        }
+
+        public static void CleanupOld() { try { File.Delete(OldExe); } catch { } }
     }
 
     // Painel de controle: as pastas e as opções gerais num lugar só. Aberto de fora da pasta de
@@ -2034,6 +2262,7 @@ namespace Foldy
             sp.Children.Add(Row("Iniciar com o Windows",
                 "Deixa o programa rodando em segundo plano desde que o PC liga. Ele é leve e é o que faz a pasta abrir com um clique.",
                 Theme.MakeToggle(Installer.Autostart, on => { Busy(() => Installer.SetAutostart(on)); return Installer.Autostart; })));
+            sp.Children.Add(TransparencyBlock());
             sp.Children.Add(Row("\"Nova pasta de apps\" no botão direito",
                 "Mostra a opção no menu do botão direito da área de trabalho (no Windows 11, fica em \"Mostrar mais opções\").",
                 Theme.MakeToggle(Store.MenuInstalled, on => { if (on) Store.InstallMenu(); else Store.UninstallMenu(); return Store.MenuInstalled; })));
@@ -2048,6 +2277,13 @@ namespace Foldy
             sp.Children.Add(Row("Programa em segundo plano",
                 running ? "Rodando." : "Parado. As pastas ainda abrem com dois cliques, mas não com um.", restart));
 
+            sp.Children.Add(Row("Atualizar sozinho",
+                "Procura versão nova a cada 6 horas e instala sem você precisar baixar nada. Só troca quando não tem nenhuma pasta aberta.",
+                Theme.MakeToggle(Config.AutoUpdate, on => { Config.AutoUpdate = on; return on; })));
+            Button check = Theme.MakeButton("Procurar agora", false);
+            check.Click += delegate { CheckForUpdateNow(); };
+            sp.Children.Add(Row("Versão " + Updater.Current.ToString(2), "Você está usando esta versão do Foldy.", check));
+
             Button uninstall = Theme.MakeButton("Desinstalar", false);
             ((TextBlock)((Border)uninstall.Content).Child).Foreground = Danger;
             uninstall.Click += delegate
@@ -2060,10 +2296,61 @@ namespace Foldy
             var danger = new TextBlock { Text = "Zona de perigo", Foreground = Theme.Muted, FontSize = 12, Margin = new Thickness(2, 16, 0, 8) };
             sp.Children.Add(danger);
             sp.Children.Add(Row("Desinstalar", "Remove o programa do PC. Os apps de dentro das pastas voltam pra área de trabalho, nada se perde.", uninstall));
-
-            Version v = Assembly.GetExecutingAssembly().GetName().Version;
-            sp.Children.Add(new TextBlock { Text = "Foldy " + v.ToString(2), Foreground = Theme.Muted, FontSize = 11.5, Margin = new Thickness(2, 14, 0, 0) });
             return sp;
+        }
+
+        void CheckForUpdateNow()
+        {
+            Updater.Release r = null;
+            if (!Busy(() => { r = Updater.Check(); if (r != null) Updater.Download(r); })) return;
+            if (r == null) { Message("Você já tem a versão mais nova (" + Updater.Current.ToString(2) + ")."); return; }
+            if (!Confirm("O Foldy " + r.Version.ToString(2) + " foi baixado. Instalar agora?\n\nO painel fecha e abre de novo já na versão nova.")) return;
+            Busy(() => Updater.Apply("--painel"));
+        }
+
+        // Transparência de todas as pastas de uma vez. Aplica quando solta a barra (refazer os
+        // ícones de todas as pastas a cada movimento do mouse seria lento).
+        UIElement TransparencyBlock()
+        {
+            var sp = new StackPanel();
+            sp.Children.Add(new TextBlock { Text = "Transparência de todas as pastas", Foreground = Theme.Text, FontSize = 14 });
+            sp.Children.Add(new TextBlock
+            {
+                Text = "Muda todas de uma vez, pra combinar com o papel de parede. Dá pra ajustar uma pasta sozinha depois, no Personalizar dela.",
+                Foreground = Theme.Muted, FontSize = 12, TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 2, 0, 10),
+            });
+            sp.Children.Add(GlobalSlider("Ícone", () => Config.IconTransparency, v => Config.IconTransparency = v, (s, v) => s.IconTransparency = v));
+            sp.Children.Add(GlobalSlider("Pasta aberta", () => Config.CardTransparency, v => Config.CardTransparency = v, (s, v) => s.CardTransparency = v));
+            return new Border { CornerRadius = new CornerRadius(12), Background = RowBackground, Padding = new Thickness(16, 12, 16, 12), Margin = new Thickness(0, 0, 0, 8), Child = sp };
+        }
+
+        UIElement GlobalSlider(string label, Func<int> saved, Action<int> save, Action<FolderStyle, int> apply)
+        {
+            int current = saved();
+            var name = new TextBlock { Text = label, Foreground = Theme.Text, FontSize = 12.5, Width = 92, VerticalAlignment = VerticalAlignment.Center };
+            var value = new TextBlock { Text = current + "%", Foreground = Theme.Muted, FontSize = 12, Width = 44, TextAlignment = TextAlignment.Right, VerticalAlignment = VerticalAlignment.Center };
+            Action redraw;
+            FrameworkElement slider = Theme.MakeSlider(() => current, v => { current = (int)v; value.Text = current + "%"; }, FolderStyle.MaxTransparency, out redraw, () =>
+            {
+                Busy(() =>
+                {
+                    save(current);
+                    foreach (string n in Store.Names())
+                    {
+                        FolderStyle s = FolderStyle.Load(n);
+                        apply(s, current);
+                        s.Save(n);
+                        Store.UpdateDesktop(n);
+                    }
+                });
+            });
+            var row = new DockPanel { Margin = new Thickness(0, 0, 0, 2) };
+            DockPanel.SetDock(name, Dock.Left);
+            DockPanel.SetDock(value, Dock.Right);
+            row.Children.Add(name);
+            row.Children.Add(value);
+            row.Children.Add(slider);
+            return row;
         }
 
         UIElement InstallPage()

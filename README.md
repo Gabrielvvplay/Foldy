@@ -18,7 +18,7 @@ Pastas de apps na área de trabalho do Windows, iguais às do iPhone e do Androi
 
 Precisa só do Windows 10/11.
 
-**Baixar:** pegue o `Foldy.exe` na página de [Releases](https://github.com/Gabrielvvplay/Foldy/releases/latest), abra ele e clique em **Instalar**. Não pede senha de administrador. Abrir uma versão mais nova do `.exe` mostra **Atualizar**, e as pastas continuam como estão.
+**Baixar:** pegue o `Foldy.exe` na página de [Releases](https://github.com/Gabrielvvplay/Foldy/releases/latest), abra ele e clique em **Instalar**. Depois disso o Foldy se atualiza sozinho (dá pra desligar no painel, em Geral). Não pede senha de administrador. Abrir uma versão mais nova do `.exe` mostra **Atualizar**, e as pastas continuam como estão.
 
 **A partir do código** (usa o compilador C# que já vem no .NET Framework):
 
