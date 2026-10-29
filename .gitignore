@@ -1,3 +1,4 @@
 ﻿*.exe
 *.ico
 *.log
+!src/icone.ico

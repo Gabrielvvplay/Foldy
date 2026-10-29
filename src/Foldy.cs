@@ -21,18 +21,21 @@ using System.Windows.Threading;
 using Accessibility;
 using Microsoft.Win32;
 
-[assembly: AssemblyTitle("Pastas Desktop")]
+[assembly: AssemblyTitle("Foldy")]
+[assembly: AssemblyVersion("1.0.0.0")]
 
-namespace PastasDesktop
+namespace Foldy
 {
     static class Store
     {
-        public static readonly string Root = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "PastasDesktop");
+        public static readonly string Root = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Foldy");
         public static readonly string FoldersDir = Path.Combine(Root, "Pastas");
         public static readonly string IconsDir = Path.Combine(Root, "Icones");
         public static readonly string Exe = Assembly.GetExecutingAssembly().Location;
+        public static readonly string InstalledExe = Path.Combine(Root, "Foldy.exe");
 
         public static string Desktop { get { return Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory); } }
+        public static string PublicDesktop { get { return Environment.GetFolderPath(Environment.SpecialFolder.CommonDesktopDirectory); } }
         public static string FolderPath(string name) { return Path.Combine(FoldersDir, name); }
         public static string DesktopLnk(string name) { return Path.Combine(Desktop, name + ".lnk"); }
 
@@ -57,10 +60,12 @@ namespace PastasDesktop
         {
             string dir = FolderPath(name);
             if (!Directory.Exists(dir)) return new List<string>();
-            return new DirectoryInfo(dir).GetFiles()
-                .Where(f => (f.Attributes & (FileAttributes.Hidden | FileAttributes.System)) == 0)
-                .OrderBy(f => f.CreationTimeUtc).ThenBy(f => f.Name)
-                .Select(f => f.FullName).ToList();
+            IEnumerable<FileInfo> files = new DirectoryInfo(dir).GetFiles()
+                .Where(f => (f.Attributes & (FileAttributes.Hidden | FileAttributes.System)) == 0);
+            files = FolderStyle.Load(name).SortByName
+                ? files.OrderBy(f => Path.GetFileNameWithoutExtension(f.Name), StringComparer.CurrentCultureIgnoreCase)
+                : files.OrderBy(f => f.CreationTimeUtc).ThenBy(f => f.Name);
+            return files.Select(f => f.FullName).ToList();
         }
 
         static bool SameDir(string a, string b)
@@ -108,7 +113,9 @@ namespace PastasDesktop
                 if (ext == ".lnk" && IsFolderLnk(src)) return; // é outra pasta
                 dest = Unique(dir, Path.GetFileName(src));
                 bool moved = false;
-                if (SameDir(srcDir, Desktop) || SameDir(Path.GetDirectoryName(srcDir), FoldersDir)) // da área de trabalho ou de outra pasta de apps
+                // Da área de trabalho (a sua ou a pública) ou de outra pasta de apps. Mover da pública
+                // só funciona se a conta tem permissão de apagar lá; senão cai na cópia.
+                if (SameDir(srcDir, Desktop) || SameDir(srcDir, PublicDesktop) || SameDir(Path.GetDirectoryName(srcDir), FoldersDir))
                 {
                     try { File.Move(src, dest); moved = true; } catch { }
                     if (moved) Shell.NotifyDeleted(src); // some da área de trabalho na hora
@@ -200,9 +207,10 @@ namespace PastasDesktop
         public static void UpdateDesktop(string name)
         {
             Directory.CreateDirectory(IconsDir);
-            List<BitmapSource> icons = Items(name).Take(4).Select(p => IconUtil.Get(p)).Where(b => b != null).ToList();
+            FolderStyle style = FolderStyle.Load(name);
+            List<BitmapSource> icons = Items(name).Take(style.Preview * style.Preview).Select(p => IconUtil.Get(p)).Where(b => b != null).ToList();
             string ico = Path.Combine(IconsDir, name + "_" + DateTime.UtcNow.Ticks + ".ico");
-            IconUtil.WriteIco(ico, new[] { 256, 64, 48, 32, 16 }.Select(s => IconUtil.RenderFolder(icons, s)).ToArray());
+            IconUtil.WriteIco(ico, new[] { 256, 64, 48, 32, 16 }.Select(s => IconUtil.RenderFolder(icons, s, style)).ToArray());
             string lnk = DesktopLnk(name);
             Shell.CreateLnk(lnk, Exe, "--abrir \"" + name + "\"", ico + ",0", Root, "Pasta de apps");
             Shell.Notify(lnk);
@@ -250,22 +258,27 @@ namespace PastasDesktop
             try { File.Delete(Path.Combine(Root, "posicoes.txt")); } catch { }
         }
 
-        const string MenuKey = @"Software\Classes\DesktopBackground\Shell\PastasDesktop";
+        const string MenuKey = @"Software\Classes\DesktopBackground\Shell\Foldy";
 
         public static void InstallMenu()
         {
             using (RegistryKey k = Registry.CurrentUser.CreateSubKey(MenuKey))
             {
                 k.SetValue("", "Nova pasta de apps");
-                k.SetValue("Icon", "imageres.dll,-3");
+                k.SetValue("Icon", InstalledExe + ",0");
                 using (RegistryKey c = k.CreateSubKey("command"))
-                    c.SetValue("", "\"" + Exe + "\" --nova");
+                    c.SetValue("", "\"" + InstalledExe + "\" --nova");
             }
         }
 
         public static void UninstallMenu()
         {
             Registry.CurrentUser.DeleteSubKeyTree(MenuKey, false);
+        }
+
+        public static bool MenuInstalled
+        {
+            get { using (RegistryKey k = Registry.CurrentUser.OpenSubKey(MenuKey)) return k != null; }
         }
     }
 
@@ -352,6 +365,7 @@ namespace PastasDesktop
         [DllImport("user32.dll")] public static extern uint GetDoubleClickTime();
         [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
         [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr FindWindow(string cls, string title);
+        [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int cmd);
         [DllImport("user32.dll", EntryPoint = "SetWindowLongPtrW")] public static extern IntPtr SetWindowLongPtr(IntPtr h, int index, IntPtr value);
         [DllImport("user32.dll", EntryPoint = "GetWindowLongPtrW")] public static extern IntPtr GetWindowLongPtr(IntPtr h, int index);
         [DllImport("oleacc.dll")]
@@ -470,7 +484,7 @@ namespace PastasDesktop
             return true;
         }
 
-        public static BitmapSource RenderFolder(List<BitmapSource> icons, int size)
+        public static BitmapSource RenderFolder(List<BitmapSource> icons, int size, FolderStyle style)
         {
             var dv = new DrawingVisual();
             RenderOptions.SetBitmapScalingMode(dv, BitmapScalingMode.HighQuality);
@@ -478,13 +492,19 @@ namespace PastasDesktop
             {
                 double k = size / 256.0;
                 dc.PushTransform(new ScaleTransform(k, k));
-                var bg = new LinearGradientBrush(Color.FromArgb(225, 70, 70, 82), Color.FromArgb(225, 34, 34, 42), 90);
                 var pen = new Pen(new SolidColorBrush(Color.FromArgb(110, 255, 255, 255)), size <= 32 ? 10 : 5);
-                dc.DrawRoundedRectangle(bg, pen, new Rect(10, 10, 236, 236), 58, 58);
-                const double pad = 40, gap = 16;
-                double cell = (256 - 2 * pad - gap) / 2;
-                for (int i = 0; i < icons.Count && i < 4; i++)
-                    dc.DrawImage(icons[i], new Rect(pad + (i % 2) * (cell + gap), pad + (i / 2) * (cell + gap), cell, cell));
+                bool circle = style.Shape == "circulo";
+                if (circle) dc.DrawEllipse(style.IconBackground, pen, new Point(128, 128), 118, 118);
+                else
+                {
+                    double radius = style.Shape == "quadrado" ? 18 : 58;
+                    dc.DrawRoundedRectangle(style.IconBackground, pen, new Rect(10, 10, 236, 236), radius, radius);
+                }
+                int n = style.Preview;
+                double pad = (n == 3 ? 34 : 40) + (circle ? 18 : 0), gap = n == 3 ? 10 : 16; // no círculo os cantos da grade ficariam pra fora
+                double cell = (256 - 2 * pad - (n - 1) * gap) / n;
+                for (int i = 0; i < icons.Count && i < n * n; i++)
+                    dc.DrawImage(icons[i], new Rect(pad + (i % n) * (cell + gap), pad + (i / n) * (cell + gap), cell, cell));
                 dc.Pop();
             }
             var rtb = new RenderTargetBitmap(size, size, 96, 96, PixelFormats.Pbgra32);
@@ -529,6 +549,8 @@ namespace PastasDesktop
         public static readonly Brush Text = Brushes.White;
         public static readonly Brush Muted = new SolidColorBrush(Color.FromArgb(150, 255, 255, 255));
         public static readonly FontFamily Font = new FontFamily("Segoe UI Variable Text, Segoe UI");
+        public static readonly FontFamily Icons = new FontFamily("Segoe Fluent Icons, Segoe MDL2 Assets");
+        public static readonly Brush Accent = new SolidColorBrush(Color.FromRgb(10, 132, 255));
 
         public static Border MakeCard(UIElement child)
         {
@@ -563,6 +585,22 @@ namespace PastasDesktop
             return b;
         }
 
+        // Interruptor liga/desliga. "changed" recebe o estado pedido e devolve o que ficou valendo.
+        public static Border MakeToggle(bool on, Func<bool, bool> changed)
+        {
+            var knob = new Border { Width = 18, Height = 18, CornerRadius = new CornerRadius(9), Background = Brushes.White, Margin = new Thickness(3) };
+            var track = new Border { Width = 44, Height = 24, CornerRadius = new CornerRadius(12), Child = knob, Cursor = Cursors.Hand };
+            Action paint = () =>
+            {
+                track.Background = on ? Accent : new SolidColorBrush(Color.FromArgb(70, 255, 255, 255));
+                knob.HorizontalAlignment = on ? HorizontalAlignment.Right : HorizontalAlignment.Left;
+            };
+            paint();
+            track.MouseLeftButtonDown += (s, e) => e.Handled = true;
+            track.MouseLeftButtonUp += delegate { on = changed(!on); paint(); };
+            return track;
+        }
+
         public static MenuItem MenuItem(string header, Action action)
         {
             var mi = new MenuItem { Header = header };
@@ -573,8 +611,8 @@ namespace PastasDesktop
         public static void Message(Window owner, string text)
         {
             if (string.IsNullOrEmpty(text)) return;
-            if (owner != null) MessageBox.Show(owner, text, "Pastas", MessageBoxButton.OK, MessageBoxImage.Information);
-            else MessageBox.Show(text, "Pastas", MessageBoxButton.OK, MessageBoxImage.Information);
+            if (owner != null) MessageBox.Show(owner, text, "Foldy", MessageBoxButton.OK, MessageBoxImage.Information);
+            else MessageBox.Show(text, "Foldy", MessageBoxButton.OK, MessageBoxImage.Information);
         }
     }
 
@@ -629,14 +667,314 @@ namespace PastasDesktop
         }
     }
 
+    // Aparência de uma pasta. Fica num arquivo oculto dentro dela, então acompanha renomeações.
+    class FolderStyle
+    {
+        public static readonly Color DefaultTint = Color.FromRgb(70, 70, 82);
+        public static readonly KeyValuePair<string, Color>[] Palette =
+        {
+            new KeyValuePair<string, Color>("Grafite", DefaultTint),
+            new KeyValuePair<string, Color>("Azul", Color.FromRgb(10, 132, 255)),
+            new KeyValuePair<string, Color>("Roxo", Color.FromRgb(140, 82, 255)),
+            new KeyValuePair<string, Color>("Rosa", Color.FromRgb(255, 55, 135)),
+            new KeyValuePair<string, Color>("Vermelho", Color.FromRgb(255, 69, 58)),
+            new KeyValuePair<string, Color>("Laranja", Color.FromRgb(255, 149, 0)),
+            new KeyValuePair<string, Color>("Amarelo", Color.FromRgb(255, 204, 0)),
+            new KeyValuePair<string, Color>("Verde", Color.FromRgb(52, 199, 89)),
+            new KeyValuePair<string, Color>("Ciano", Color.FromRgb(50, 173, 230)),
+        };
+
+        public Color Tint = DefaultTint;
+        public string Shape = "arredondado"; // arredondado, circulo, quadrado
+        public int Preview = 2;              // apps por lado na miniatura do ícone (2x2 ou 3x3)
+        public int Columns;                  // colunas no popup; 0 = automático
+        public int IconSize = 52;
+        public bool SortByName;
+
+        static string FileOf(string name) { return Path.Combine(Store.FolderPath(name), ".estilo"); }
+
+        public static FolderStyle Load(string name)
+        {
+            var s = new FolderStyle();
+            string f = FileOf(name);
+            if (!File.Exists(f)) return s;
+            try
+            {
+                foreach (string line in File.ReadAllLines(f))
+                {
+                    int i = line.IndexOf('=');
+                    if (i < 0) continue;
+                    string key = line.Substring(0, i).Trim(), v = line.Substring(i + 1).Trim();
+                    int n;
+                    int.TryParse(v, out n);
+                    switch (key)
+                    {
+                        case "cor": try { s.Tint = (Color)ColorConverter.ConvertFromString(v); } catch { } break;
+                        case "formato": if (v == "circulo" || v == "quadrado") s.Shape = v; break;
+                        case "previa": if (n == 3) s.Preview = 3; break;
+                        case "colunas": if (n >= 0 && n <= 6) s.Columns = n; break;
+                        case "icones": if (n >= 32 && n <= 96) s.IconSize = n; break;
+                        case "ordem": s.SortByName = v == "nome"; break;
+                    }
+                }
+            }
+            catch (Exception ex) { Log.Write("Lendo estilo de " + name + ": " + ex.Message); }
+            return s;
+        }
+
+        public void Save(string name)
+        {
+            string f = FileOf(name);
+            if (File.Exists(f)) File.SetAttributes(f, FileAttributes.Normal); // arquivo oculto não pode ser sobrescrito
+            File.WriteAllLines(f, new[]
+            {
+                string.Format("cor=#{0:X2}{1:X2}{2:X2}", Tint.R, Tint.G, Tint.B),
+                "formato=" + Shape,
+                "previa=" + Preview,
+                "colunas=" + Columns,
+                "icones=" + IconSize,
+                "ordem=" + (SortByName ? "nome" : "entrada"),
+            });
+            File.SetAttributes(f, FileAttributes.Hidden);
+        }
+
+        public FolderStyle Clone() { return (FolderStyle)MemberwiseClone(); }
+
+        static Color Mix(Color a, Color b, double t)
+        {
+            return Color.FromRgb((byte)(a.R + (b.R - a.R) * t), (byte)(a.G + (b.G - a.G) * t), (byte)(a.B + (b.B - a.B) * t));
+        }
+
+        public Brush IconBackground
+        {
+            get
+            {
+                Color dark = Mix(Colors.Black, Tint, 0.5);
+                return new LinearGradientBrush(Color.FromArgb(225, Tint.R, Tint.G, Tint.B), Color.FromArgb(225, dark.R, dark.G, dark.B), 90);
+            }
+        }
+
+        // Fundo do popup: a cor da pasta bem escurecida, pra o texto branco continuar legível.
+        public Brush CardBackground
+        {
+            get
+            {
+                if (Tint == DefaultTint) return Theme.Card;
+                Color m = Mix(Color.FromRgb(30, 30, 36), Tint, 0.28);
+                return new SolidColorBrush(Color.FromArgb(238, m.R, m.G, m.B));
+            }
+        }
+    }
+
+    class OwnerHandle : System.Windows.Forms.IWin32Window
+    {
+        public OwnerHandle(Window w) { Handle = new WindowInteropHelper(w).Handle; }
+        public IntPtr Handle { get; private set; }
+    }
+
+    // Janela "Personalizar pasta", com prévia ao vivo do ícone.
+    class CustomizeDialog : Window
+    {
+        static readonly Brush Selected = new SolidColorBrush(Color.FromRgb(10, 132, 255));
+
+        public FolderStyle Result { get; private set; }
+        public string NewName { get { return nameBox.Text; } }
+
+        readonly TextBox nameBox;
+        readonly Image preview;
+        readonly List<Action> refreshers = new List<Action>();
+        readonly List<string> items;
+
+        public CustomizeDialog(string folder, FolderStyle current)
+        {
+            Result = current.Clone();
+            items = Store.Items(folder);
+            WindowStyle = WindowStyle.None; AllowsTransparency = true; Background = Brushes.Transparent;
+            ResizeMode = ResizeMode.NoResize; SizeToContent = SizeToContent.WidthAndHeight; Topmost = true; ShowInTaskbar = false;
+            WindowStartupLocation = WindowStartupLocation.CenterScreen; FontFamily = Theme.Font; Title = "Personalizar pasta";
+
+            var stack = new StackPanel { Width = 400 };
+            stack.Children.Add(new TextBlock { Text = "Personalizar pasta", Foreground = Theme.Text, FontSize = 17, FontWeight = FontWeights.SemiBold, Margin = new Thickness(2, 0, 0, 14) });
+
+            preview = new Image { Width = 96, Height = 96, Margin = new Thickness(0, 0, 16, 0), VerticalAlignment = VerticalAlignment.Top };
+            RenderOptions.SetBitmapScalingMode(preview, BitmapScalingMode.HighQuality);
+            nameBox = new TextBox
+            {
+                Text = folder, FontSize = 15, Padding = new Thickness(8, 6, 8, 6),
+                Background = new SolidColorBrush(Color.FromArgb(40, 255, 255, 255)), Foreground = Theme.Text,
+                CaretBrush = Theme.Text, BorderBrush = Theme.Stroke, SelectionBrush = Selected,
+            };
+            var nameCol = new StackPanel { VerticalAlignment = VerticalAlignment.Center };
+            nameCol.Children.Add(Label("Nome"));
+            nameCol.Children.Add(nameBox);
+            var top = new DockPanel { Margin = new Thickness(0, 0, 0, 6) };
+            DockPanel.SetDock(preview, Dock.Left);
+            top.Children.Add(preview);
+            top.Children.Add(nameCol);
+            stack.Children.Add(top);
+
+            stack.Children.Add(Label("Cor"));
+            stack.Children.Add(Swatches());
+            stack.Children.Add(Choice("Formato do ícone", new[] { "Arredondado", "Círculo", "Quadrado" }, new[] { "arredondado", "circulo", "quadrado" },
+                () => Result.Shape, v => Result.Shape = v));
+            stack.Children.Add(Choice("Apps no ícone", new[] { "4 (2×2)", "9 (3×3)" }, new[] { 2, 3 },
+                () => Result.Preview, v => Result.Preview = v));
+            stack.Children.Add(Choice("Colunas na pasta", new[] { "Automático", "3", "4", "5" }, new[] { 0, 3, 4, 5 },
+                () => Result.Columns, v => Result.Columns = v));
+            stack.Children.Add(Choice("Tamanho dos apps", new[] { "Pequeno", "Médio", "Grande" }, new[] { 40, 52, 64 },
+                () => Result.IconSize, v => Result.IconSize = v));
+            stack.Children.Add(Choice("Ordem dos apps", new[] { "Ordem que entraram", "Nome (A–Z)" }, new[] { false, true },
+                () => Result.SortByName, v => Result.SortByName = v));
+
+            var reset = Theme.MakeButton("Restaurar padrão", false);
+            reset.Margin = new Thickness(0);
+            reset.Click += delegate { Result = new FolderStyle(); Refresh(); };
+            var cancel = Theme.MakeButton("Cancelar", false);
+            var save = Theme.MakeButton("Salvar", true);
+            cancel.Click += delegate { Close(); };
+            save.Click += delegate { DialogResult = true; };
+            var buttons = new DockPanel { Margin = new Thickness(0, 10, 0, 0), LastChildFill = false };
+            DockPanel.SetDock(reset, Dock.Left);
+            DockPanel.SetDock(save, Dock.Right);
+            DockPanel.SetDock(cancel, Dock.Right);
+            buttons.Children.Add(reset);
+            buttons.Children.Add(save);
+            buttons.Children.Add(cancel);
+            stack.Children.Add(buttons);
+
+            var card = Theme.MakeCard(stack);
+            card.Padding = new Thickness(20, 16, 20, 18);
+            card.MouseLeftButtonDown += delegate { try { DragMove(); } catch { } };
+            Content = card;
+
+            PreviewKeyDown += (s, e) =>
+            {
+                if (e.Key == Key.Enter) DialogResult = true;
+                else if (e.Key == Key.Escape) Close();
+            };
+            Loaded += delegate { Native.ForceForeground(new WindowInteropHelper(this).Handle); Activate(); };
+            Refresh();
+        }
+
+        // Abre a janela e aplica o que foi salvo (nome, estilo e ícone da área de trabalho).
+        // Retorna o nome final da pasta, ou null se nada mudou.
+        public static string Edit(Window owner, string name, Action<string> message)
+        {
+            var d = new CustomizeDialog(name, FolderStyle.Load(name)) { Owner = owner, WindowStartupLocation = WindowStartupLocation.CenterOwner };
+            if (d.ShowDialog() != true) return null;
+            string n = Store.CleanName(d.NewName);
+            if (n != "" && n != name)
+            {
+                string err = Store.Rename(name, n);
+                if (err != null) { message(err); return null; }
+                name = n;
+            }
+            try { d.Result.Save(name); }
+            catch (Exception ex) { message("Não consegui salvar a personalização: " + ex.Message); return name; }
+            try { Store.UpdateDesktop(name); } catch (Exception ex) { message("Não consegui atualizar o ícone: " + ex.Message); }
+            return name;
+        }
+
+        void Refresh()
+        {
+            foreach (Action a in refreshers) a();
+            List<string> order = Result.SortByName
+                ? items.OrderBy(p => Path.GetFileNameWithoutExtension(p), StringComparer.CurrentCultureIgnoreCase).ToList()
+                : items.OrderBy(p => File.GetCreationTimeUtc(p)).ToList();
+            List<BitmapSource> icons = order.Take(Result.Preview * Result.Preview).Select(p => IconUtil.Get(p)).Where(b => b != null).ToList();
+            preview.Source = IconUtil.RenderFolder(icons, 192, Result);
+        }
+
+        static TextBlock Label(string text)
+        {
+            return new TextBlock { Text = text, Foreground = Theme.Muted, FontSize = 12, Margin = new Thickness(2, 10, 0, 6) };
+        }
+
+        // Bolinha de cor; o anel branco marca a escolhida.
+        Border Dot(Brush fill, UIElement content, string tooltip, Func<bool> isSelected, Action pick)
+        {
+            var inner = new Border { CornerRadius = new CornerRadius(13), Background = fill, Child = content };
+            var ring = new Border
+            {
+                Width = 34, Height = 34, CornerRadius = new CornerRadius(17), BorderThickness = new Thickness(2),
+                Padding = new Thickness(2), Margin = new Thickness(0, 0, 6, 6), Child = inner, Cursor = Cursors.Hand, ToolTip = tooltip,
+            };
+            ring.MouseLeftButtonDown += (s, e) => e.Handled = true; // senão o DragMove do cartão engole o clique
+            ring.MouseLeftButtonUp += delegate { pick(); Refresh(); };
+            refreshers.Add(() => ring.BorderBrush = isSelected() ? Theme.Text : Brushes.Transparent);
+            return ring;
+        }
+
+        UIElement Swatches()
+        {
+            var panel = new WrapPanel();
+            foreach (var p in FolderStyle.Palette)
+            {
+                Color c = p.Value;
+                panel.Children.Add(Dot(new SolidColorBrush(c), null, p.Key, () => Result.Tint == c, () => Result.Tint = c));
+            }
+            // Qualquer outra cor, pelo seletor do Windows.
+            var plus = new TextBlock { Text = "+", Foreground = Theme.Text, FontSize = 17, HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, -2, 0, 0) };
+            var rainbow = new LinearGradientBrush(new GradientStopCollection
+            {
+                new GradientStop(Color.FromRgb(255, 69, 58), 0), new GradientStop(Color.FromRgb(255, 204, 0), 0.33),
+                new GradientStop(Color.FromRgb(52, 199, 89), 0.66), new GradientStop(Color.FromRgb(10, 132, 255), 1),
+            }, 45);
+            Border custom = Dot(rainbow, plus, "Outra cor...", () => !FolderStyle.Palette.Any(p => p.Value == Result.Tint), PickColor);
+            refreshers.Add(() =>
+            {
+                bool own = !FolderStyle.Palette.Any(p => p.Value == Result.Tint);
+                ((Border)custom.Child).Background = own ? new SolidColorBrush(Result.Tint) : (Brush)rainbow;
+            });
+            panel.Children.Add(custom);
+            return panel;
+        }
+
+        void PickColor()
+        {
+            var dlg = new System.Windows.Forms.ColorDialog
+            {
+                FullOpen = true,
+                Color = System.Drawing.Color.FromArgb(Result.Tint.R, Result.Tint.G, Result.Tint.B),
+            };
+            if (dlg.ShowDialog(new OwnerHandle(this)) == System.Windows.Forms.DialogResult.OK)
+                Result.Tint = Color.FromRgb(dlg.Color.R, dlg.Color.G, dlg.Color.B);
+            Activate();
+        }
+
+        UIElement Choice<T>(string label, string[] texts, T[] values, Func<T> get, Action<T> set)
+        {
+            var sp = new StackPanel();
+            sp.Children.Add(Label(label));
+            var row = new WrapPanel();
+            for (int i = 0; i < texts.Length; i++)
+            {
+                T v = values[i];
+                var b = new Border
+                {
+                    CornerRadius = new CornerRadius(9), Padding = new Thickness(12, 6, 12, 7), Margin = new Thickness(0, 0, 6, 6),
+                    Cursor = Cursors.Hand, Child = new TextBlock { Text = texts[i], Foreground = Theme.Text, FontSize = 12.5 },
+                };
+                b.MouseLeftButtonDown += (s, e) => e.Handled = true; // senão o DragMove do cartão engole o clique
+                b.MouseLeftButtonUp += delegate { set(v); Refresh(); };
+                refreshers.Add(() => b.Background = EqualityComparer<T>.Default.Equals(get(), v) ? Selected : Theme.Hover);
+                row.Children.Add(b);
+            }
+            sp.Children.Add(row);
+            return sp;
+        }
+    }
+
     // O popup com os apps da pasta.
     class FolderWindow : Window
     {
-        const double TileW = 96;
         public string FolderName { get { return name; } }
         string name;
+        FolderStyle style;
+        double TileW { get { return style.IconSize + 44; } }
         readonly System.Drawing.Point anchor;
         readonly TextBlock title, hint;
+        readonly TextBox titleBox;
         readonly WrapPanel grid;
         readonly Border card;
         readonly ScaleTransform zoom = new ScaleTransform(0.88, 0.88);
@@ -649,6 +987,7 @@ namespace PastasDesktop
         {
             this.name = name;
             this.anchor = anchor;
+            style = FolderStyle.Load(name);
             WindowStyle = WindowStyle.None; AllowsTransparency = true; Background = Brushes.Transparent;
             ShowInTaskbar = false; Topmost = true; ResizeMode = ResizeMode.NoResize; SizeToContent = SizeToContent.WidthAndHeight;
             WindowStartupLocation = WindowStartupLocation.Manual; Left = -20000; Top = -20000;
@@ -657,9 +996,52 @@ namespace PastasDesktop
             title = new TextBlock
             {
                 Text = name, Foreground = Theme.Text, FontSize = 19, FontWeight = FontWeights.SemiBold,
-                HorizontalAlignment = HorizontalAlignment.Center, Margin = new Thickness(0, 0, 0, 12),
+                HorizontalAlignment = HorizontalAlignment.Center, Margin = new Thickness(30, 0, 30, 0),
                 TextTrimming = TextTrimming.CharacterEllipsis, MaxWidth = 360,
             };
+            // Engrenagem no canto: abre o "Personalizar pasta".
+            var gearText = new TextBlock
+            {
+                Text = "", FontFamily = Theme.Icons, FontSize = 14,
+                Foreground = Theme.Muted, HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center,
+            };
+            var gear = new Border
+            {
+                Width = 28, Height = 28, CornerRadius = new CornerRadius(14), Background = Brushes.Transparent, Child = gearText,
+                HorizontalAlignment = HorizontalAlignment.Right, VerticalAlignment = VerticalAlignment.Center,
+                Cursor = Cursors.Hand, ToolTip = "Personalizar pasta",
+            };
+            gear.MouseEnter += delegate { gear.Background = Theme.Hover; gearText.Foreground = Theme.Text; };
+            gear.MouseLeave += delegate { gear.Background = Brushes.Transparent; gearText.Foreground = Theme.Muted; };
+            gear.MouseLeftButtonUp += delegate { Customize(); };
+            // Clicar no nome troca ele por uma caixa de texto pra renomear ali mesmo.
+            // Mesma fonte do nome, sem moldura: só um traço embaixo mostra que está editando.
+            var underline = new FrameworkElementFactory(typeof(Border));
+            underline.SetValue(Border.BorderBrushProperty, Theme.Muted);
+            underline.SetValue(Border.BorderThicknessProperty, new Thickness(0, 0, 0, 1.5));
+            var host = new FrameworkElementFactory(typeof(ScrollViewer)) { Name = "PART_ContentHost" };
+            underline.AppendChild(host);
+            titleBox = new TextBox
+            {
+                FontSize = 19, FontWeight = FontWeights.SemiBold, TextAlignment = TextAlignment.Center,
+                HorizontalAlignment = HorizontalAlignment.Center, Margin = new Thickness(30, 0, 30, 0), Padding = new Thickness(0),
+                Background = Brushes.Transparent, Foreground = Theme.Text, CaretBrush = Theme.Text,
+                SelectionBrush = new SolidColorBrush(Color.FromRgb(10, 132, 255)), Visibility = Visibility.Collapsed,
+                Template = new ControlTemplate(typeof(TextBox)) { VisualTree = underline },
+            };
+            title.Cursor = Cursors.IBeam;
+            title.ToolTip = "Clique pra renomear";
+            title.MouseLeftButtonUp += delegate { StartEditingName(); };
+            titleBox.PreviewKeyDown += (s, e) =>
+            {
+                if (e.Key == Key.Enter) { e.Handled = true; FinishEditingName(true); }
+                else if (e.Key == Key.Escape) { e.Handled = true; FinishEditingName(false); }
+            };
+            titleBox.LostKeyboardFocus += delegate { FinishEditingName(true); };
+            var header = new Grid { Margin = new Thickness(0, 0, 0, 12) };
+            header.Children.Add(title);
+            header.Children.Add(titleBox);
+            header.Children.Add(gear);
             hint = new TextBlock
             {
                 Text = "Pasta vazia.\nArraste atalhos pra cima do ícone dela na área de trabalho.",
@@ -672,11 +1054,12 @@ namespace PastasDesktop
                 VerticalScrollBarVisibility = ScrollBarVisibility.Auto, HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled,
             };
             var stack = new StackPanel();
-            stack.Children.Add(title);
+            stack.Children.Add(header);
             stack.Children.Add(hint);
             stack.Children.Add(scroller);
 
             card = Theme.MakeCard(stack);
+            card.Background = style.CardBackground;
             card.Opacity = 0;
             card.RenderTransform = zoom;
             card.RenderTransformOrigin = new Point(0.5, 0.5);
@@ -693,6 +1076,17 @@ namespace PastasDesktop
                 Dispatcher.BeginInvoke(new Action(() => { if (!IsActive && !suppress) CloseAnimated(); }), DispatcherPriority.Background);
             };
             KeyDown += (s, e) => { if (e.Key == Key.Escape) CloseAnimated(); };
+            // A margem em volta do cartão (onde fica a sombra) ainda é parte da janela; clicar nela
+            // não tira o foco, então conta como clicar fora.
+            PreviewMouseDown += (s, e) =>
+            {
+                // Editando o nome: clicar em qualquer outro lugar confirma (o fundo da pasta não pega o foco sozinho).
+                if (titleBox.Visibility == Visibility.Visible && !titleBox.IsMouseOver) FinishEditingName(true);
+                Point p = e.GetPosition(card);
+                if (p.X >= 0 && p.Y >= 0 && p.X <= card.ActualWidth && p.Y <= card.ActualHeight) return;
+                e.Handled = true;
+                CloseAnimated();
+            };
             SizeChanged += delegate { Reposition(); };
             Loaded += delegate
             {
@@ -708,7 +1102,8 @@ namespace PastasDesktop
         {
             grid.Children.Clear();
             List<string> items = Store.Items(name);
-            grid.Width = (items.Count <= 3 ? 3 : 4) * TileW;
+            int columns = style.Columns > 0 ? style.Columns : (items.Count <= 3 ? 3 : 4);
+            grid.Width = columns * TileW;
             foreach (string p in items) grid.Children.Add(MakeTile(p));
             grid.Visibility = items.Count == 0 ? Visibility.Collapsed : Visibility.Visible;
             hint.Visibility = items.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
@@ -745,7 +1140,7 @@ namespace PastasDesktop
             sp.Children.Add(text);
             var b = new Border
             {
-                Width = TileW - 8, Height = 106, Margin = new Thickness(4), CornerRadius = new CornerRadius(14),
+                Width = TileW - 8, Height = style.IconSize + 54, Margin = new Thickness(4), CornerRadius = new CornerRadius(14),
                 Padding = new Thickness(6, 10, 6, 4), Background = Brushes.Transparent, Child = sp,
                 Cursor = Cursors.Hand, ToolTip = tooltip,
             };
@@ -821,7 +1216,7 @@ namespace PastasDesktop
 
         Border MakeTile(string path)
         {
-            var img = new Image { Source = IconUtil.Get(path), Width = 52, Height = 52 };
+            var img = new Image { Source = IconUtil.Get(path), Width = style.IconSize, Height = style.IconSize };
             RenderOptions.SetBitmapScalingMode(img, BitmapScalingMode.HighQuality);
             string label = Path.GetFileNameWithoutExtension(path);
             Border tile = Tile(img, label, label, path);
@@ -850,6 +1245,7 @@ namespace PastasDesktop
             return new List<MenuItem>
             {
                 Theme.MenuItem("Adicionar apps...", AddViaDialog),
+                Theme.MenuItem("Personalizar pasta...", Customize),
                 Theme.MenuItem("Renomear pasta...", RenameFolder),
                 Theme.MenuItem("Abrir no Explorador", () =>
                 {
@@ -857,6 +1253,11 @@ namespace PastasDesktop
                     CloseAnimated();
                 }),
                 Theme.MenuItem("Excluir pasta", DeleteFolder),
+                Theme.MenuItem("Painel de controle...", () =>
+                {
+                    try { Process.Start(Store.Exe, "--painel"); } catch (Exception ex) { Message(ex.Message); }
+                    CloseAnimated();
+                }),
             };
         }
 
@@ -912,13 +1313,55 @@ namespace PastasDesktop
         {
             suppress = true;
             string n = Store.CleanName(InputDialog.Ask(this, "Renomear pasta", name, "Salvar"));
-            string err = Store.Rename(name, n);
             suppress = false;
             Activate();
-            if (err != null) { Message(err); return; }
+            ApplyName(n);
+        }
+
+        void StartEditingName()
+        {
+            if (titleBox.Visibility == Visibility.Visible) return;
+            titleBox.Text = name;
+            titleBox.MinWidth = Math.Max(60, title.ActualWidth + 8);
+            title.Visibility = Visibility.Hidden; // Hidden (não Collapsed) pra o popup não mudar de tamanho
+            titleBox.Visibility = Visibility.Visible;
+            titleBox.Focus();
+            titleBox.SelectAll();
+        }
+
+        void FinishEditingName(bool save)
+        {
+            if (titleBox.Visibility != Visibility.Visible) return;
+            titleBox.Visibility = Visibility.Collapsed;
+            title.Visibility = Visibility.Visible;
+            if (!save) return;
+            string n = Store.CleanName(titleBox.Text);
+            if (n != "" && n != name) ApplyName(n);
+        }
+
+        bool ApplyName(string n)
+        {
+            string err = Store.Rename(name, n);
+            if (err != null) { Message(err); return false; }
             name = n;
             title.Text = n;
             Title = n;
+            return true;
+        }
+
+        void Customize()
+        {
+            suppress = true;
+            string n = CustomizeDialog.Edit(this, name, text => Theme.Message(this, text));
+            suppress = false;
+            Activate();
+            if (n == null) return;
+            name = n;
+            title.Text = n;
+            Title = n;
+            style = FolderStyle.Load(name);
+            card.Background = style.CardBackground;
+            Build();
         }
 
         void DeleteFolder()
@@ -932,7 +1375,7 @@ namespace PastasDesktop
         bool Confirm(string text)
         {
             suppress = true;
-            bool yes = MessageBox.Show(this, text, "Pastas", MessageBoxButton.YesNo, MessageBoxImage.Question) == MessageBoxResult.Yes;
+            bool yes = MessageBox.Show(this, text, "Foldy", MessageBoxButton.YesNo, MessageBoxImage.Question) == MessageBoxResult.Yes;
             suppress = false;
             Activate();
             return yes;
@@ -1084,7 +1527,7 @@ namespace PastasDesktop
     // Fica rodando em segundo plano: abre as pastas com um clique e mantém os ícones atualizados.
     class Resident
     {
-        public const string WindowTitle = "PastasDesktopResidente";
+        public const string WindowTitle = "FoldyResidente";
         const int WM_COPYDATA = 0x4A;
 
         readonly Dictionary<string, string> signatures = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
@@ -1147,7 +1590,7 @@ namespace PastasDesktop
             {
                 foreach (string n in Store.Names())
                 {
-                    string sig = string.Join("|", Store.Items(n).Take(4));
+                    string sig = string.Join("|", Store.Items(n).Take(9));
                     string old;
                     if (sig == "" && signatures.TryGetValue(n, out old) && old != "")
                     {
@@ -1187,6 +1630,7 @@ namespace PastasDesktop
             if (string.IsNullOrEmpty(name)) return;
             if (name.EndsWith(".lnk", StringComparison.OrdinalIgnoreCase)) name = name.Substring(0, name.Length - 4);
             if (!Store.Exists(name) || !File.Exists(Store.DesktopLnk(name)) || Store.NameTakenOnDesktop(name)) return;
+            if (!Config.OneClick) return; // desligado no painel: só o duplo clique abre
             Open(name, new System.Drawing.Point(pt.X, pt.Y));
         }
 
@@ -1226,6 +1670,489 @@ namespace PastasDesktop
         }
     }
 
+    // Opções gerais do programa (as de cada pasta ficam no FolderStyle).
+    static class Config
+    {
+        public static readonly string FilePath = Path.Combine(Store.Root, "config.txt");
+
+        public static bool OneClick
+        {
+            get { return Get("umclique") != "0"; }
+            set { Set("umclique", value ? "1" : "0"); }
+        }
+
+        static Dictionary<string, string> Load()
+        {
+            var d = new Dictionary<string, string>();
+            try
+            {
+                if (!File.Exists(FilePath)) return d;
+                foreach (string line in File.ReadAllLines(FilePath))
+                {
+                    int i = line.IndexOf('=');
+                    if (i > 0) d[line.Substring(0, i).Trim()] = line.Substring(i + 1).Trim();
+                }
+            }
+            catch (Exception ex) { Log.Write("Lendo config: " + ex.Message); }
+            return d;
+        }
+
+        static string Get(string key)
+        {
+            string v;
+            return Load().TryGetValue(key, out v) ? v : null;
+        }
+
+        static void Set(string key, string value)
+        {
+            Dictionary<string, string> d = Load();
+            d[key] = value;
+            File.WriteAllLines(FilePath, d.Select(p => p.Key + "=" + p.Value));
+        }
+    }
+
+    // Instalar, iniciar com o Windows e desinstalar, tudo pelo próprio .exe: quem baixa o
+    // programa não precisa rodar script nenhum, nem ter permissão de administrador.
+    static class Installer
+    {
+        const string TaskName = "Foldy";
+        static readonly string[][] StartMenu = { new[] { "Foldy", "--painel" }, new[] { "Nova pasta de apps", "--nova" } };
+        static string Programs { get { return Environment.GetFolderPath(Environment.SpecialFolder.Programs); } }
+
+        public static bool IsInstalledCopy { get { return string.Equals(Store.Exe, Store.InstalledExe, StringComparison.OrdinalIgnoreCase); } }
+        public static bool HasInstall { get { return File.Exists(Store.InstalledExe); } }
+
+        // Copia este .exe (ex.: o que foi baixado) pra pasta de instalação, fechando a versão antiga se estiver rodando.
+        public static void CopyToInstallDir()
+        {
+            if (IsInstalledCopy) return;
+            Directory.CreateDirectory(Store.Root);
+            StopOthers();
+            File.Copy(Store.Exe, Store.InstalledExe, true);
+        }
+
+        // Roda na cópia instalada: menu do botão direito, Menu Iniciar, início com o Windows e o residente.
+        public static void Setup()
+        {
+            try { MigrateFromPastasDesktop(); } catch (Exception ex) { Log.Write("Migrando do Pastas Desktop: " + ex); }
+            Store.InstallMenu();
+            foreach (string[] s in StartMenu)
+                Shell.CreateLnk(Path.Combine(Programs, s[0] + ".lnk"), Store.InstalledExe, s[1], Store.InstalledExe + ",0", Store.Root, null);
+            SetAutostart(true);
+            Program.StartResident();
+        }
+
+        // Antes de virar Foldy o programa se chamava "Pastas Desktop" e ficava em %LOCALAPPDATA%\PastasDesktop.
+        // Traz as pastas e o resto de lá, refaz os ícones (os antigos apontam pro .exe velho) e tira
+        // a tarefa, o menu e o atalho antigos.
+        static void MigrateFromPastasDesktop()
+        {
+            string old = Path.Combine(Path.GetDirectoryName(Store.Root), "PastasDesktop");
+            if (!Directory.Exists(old)) return;
+            foreach (Process p in Process.GetProcessesByName("PastasDesktop")) { try { p.Kill(); p.WaitForExit(3000); } catch { } }
+
+            foreach (string sub in new[] { "Icones", "PastasDesktop.exe", "log.txt" })
+            {
+                string path = Path.Combine(old, sub);
+                try { if (Directory.Exists(path)) Directory.Delete(path, true); else File.Delete(path); } catch { }
+            }
+            string oldFolders = Path.Combine(old, "Pastas");
+            if (Directory.Exists(oldFolders))
+            {
+                foreach (string dir in Directory.GetDirectories(oldFolders))
+                {
+                    string dest = Store.FolderPath(Path.GetFileName(dir));
+                    if (!Directory.Exists(dest)) Directory.Move(dir, dest);
+                }
+                try { Directory.Delete(oldFolders); } catch { }
+            }
+            // O que sobrar (config, backups) vem junto.
+            foreach (string entry in Directory.GetFileSystemEntries(old))
+            {
+                string dest = Path.Combine(Store.Root, Path.GetFileName(entry));
+                if (File.Exists(dest) || Directory.Exists(dest)) continue;
+                if (Directory.Exists(entry)) Directory.Move(entry, dest); else File.Move(entry, dest);
+            }
+            try { Directory.Delete(old); } catch { } // só sai se ficou vazia
+
+            foreach (string n in Store.Names()) { try { Store.UpdateDesktop(n); } catch (Exception ex) { Log.Write("Refazendo ícone de " + n + ": " + ex.Message); } }
+            Registry.CurrentUser.DeleteSubKeyTree(@"Software\Classes\DesktopBackground\Shell\PastasDesktop", false);
+            RunPowerShell("Unregister-ScheduledTask -TaskName PastasDesktop -Confirm:$false -ErrorAction SilentlyContinue");
+            try { File.Delete(Path.Combine(Programs, "Pastas.lnk")); } catch { }
+            Log.Write("Pastas trazidas da instalação antiga (Pastas Desktop).");
+        }
+
+        // Tira tudo do PC. Os apps das pastas voltam pra área de trabalho, então nada se perde.
+        public static void Uninstall()
+        {
+            StopOthers();
+            foreach (string n in Store.Names()) Store.DeleteFolder(n);
+            Store.UninstallMenu();
+            SetAutostart(false);
+            foreach (string[] s in StartMenu) { try { File.Delete(Path.Combine(Programs, s[0] + ".lnk")); } catch { } }
+            foreach (string d in new[] { Store.FoldersDir, Store.IconsDir }) { try { Directory.Delete(d, true); } catch { } }
+            foreach (string f in new[] { Config.FilePath, Path.Combine(Store.Root, "log.txt") }) { try { File.Delete(f); } catch { } }
+            // O .exe em uso só pode ser apagado depois que o programa fecha. A pasta só sai se ficou
+            // vazia, pra não levar junto nada que não seja nosso.
+            Process.Start(new ProcessStartInfo("cmd.exe",
+                "/c ping -n 3 127.0.0.1 >nul & del /f /q \"" + Store.InstalledExe + "\" & rmdir \"" + Store.Root + "\"")
+                { CreateNoWindow = true, UseShellExecute = false });
+        }
+
+        public static void StopOthers()
+        {
+            int me = Process.GetCurrentProcess().Id;
+            foreach (Process p in Process.GetProcessesByName("Foldy"))
+            {
+                if (p.Id == me) continue;
+                try { p.Kill(); p.WaitForExit(3000); } catch { }
+            }
+        }
+
+        public static bool ResidentRunning
+        {
+            get
+            {
+                Mutex m;
+                if (!Mutex.TryOpenExisting(@"Local\FoldyResidente", out m)) return false;
+                m.Dispose();
+                return true;
+            }
+        }
+
+        public static bool Autostart { get { return Run("schtasks.exe", "/Query /TN " + TaskName) == 0; } }
+
+        // Tarefa agendada: inicia no logon e, a cada 5 minutos, reabre o residente se ele tiver fechado.
+        public static void SetAutostart(bool on)
+        {
+            string exe = Store.InstalledExe.Replace("'", "''");
+            string ps = on
+                ? "$a = New-ScheduledTaskAction -Execute '" + exe + "' -Argument '--residente';" +
+                  "$l = New-ScheduledTaskTrigger -AtLogOn -User \"$env:USERDOMAIN\\$env:USERNAME\";" +
+                  "$r = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 5);" +
+                  "$s = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew;" +
+                  "Register-ScheduledTask -TaskName " + TaskName + " -Action $a -Trigger $l, $r -Settings $s -Force | Out-Null"
+                : "Unregister-ScheduledTask -TaskName " + TaskName + " -Confirm:$false -ErrorAction SilentlyContinue";
+            int code = RunPowerShell(ps);
+            if (code != 0) Log.Write("Tarefa agendada (" + (on ? "criar" : "remover") + ") terminou com código " + code + ".");
+        }
+
+        static int RunPowerShell(string script)
+        {
+            return Run("powershell.exe", "-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand " +
+                Convert.ToBase64String(Encoding.Unicode.GetBytes(script)));
+        }
+
+        static int Run(string file, string args)
+        {
+            var psi = new ProcessStartInfo(file, args) { CreateNoWindow = true, UseShellExecute = false };
+            using (Process p = Process.Start(psi))
+            {
+                if (!p.WaitForExit(30000)) return -1;
+                return p.ExitCode;
+            }
+        }
+    }
+
+    // Painel de controle: as pastas e as opções gerais num lugar só. Aberto de fora da pasta de
+    // instalação (ex.: o .exe recém-baixado), mostra a tela de instalar.
+    class ControlPanel : Window
+    {
+        public const string WindowTitle = "Foldy";
+        static readonly Brush Surface = new SolidColorBrush(Color.FromRgb(28, 28, 34));
+        static readonly Brush RowBackground = new SolidColorBrush(Color.FromArgb(18, 255, 255, 255));
+        static readonly Brush NavSelected = new SolidColorBrush(Color.FromArgb(50, 255, 255, 255));
+        static readonly Brush Danger = new SolidColorBrush(Color.FromRgb(255, 105, 97));
+
+        readonly ContentControl page = new ContentControl();
+        readonly StackPanel nav = new StackPanel { Margin = new Thickness(10, 4, 10, 0) };
+        string current = "pastas";
+
+        public ControlPanel()
+        {
+            WindowStyle = WindowStyle.None; AllowsTransparency = true; Background = Brushes.Transparent;
+            ResizeMode = ResizeMode.CanMinimize; Width = 780; Height = 560;
+            WindowStartupLocation = WindowStartupLocation.CenterScreen; FontFamily = Theme.Font; Title = WindowTitle;
+            Icon = AppIcon();
+
+            var scroller = new ScrollViewer
+            {
+                Content = page, VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+                HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled, Padding = new Thickness(12, 0, 28, 20),
+            };
+            var body = new Grid();
+            if (Installer.IsInstalledCopy)
+            {
+                body.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(200) });
+                body.ColumnDefinitions.Add(new ColumnDefinition());
+                Grid.SetColumn(scroller, 1);
+                body.Children.Add(nav);
+                AddNav("pastas", "", "Pastas");
+                AddNav("geral", "", "Geral");
+                Show("pastas");
+                Activated += delegate { Show(current); }; // pega mudanças feitas pela área de trabalho
+            }
+            else page.Content = InstallPage();
+            body.Children.Add(scroller);
+
+            UIElement bar = TopBar();
+            var layout = new DockPanel();
+            DockPanel.SetDock(bar, Dock.Top);
+            layout.Children.Add(bar);
+            layout.Children.Add(body);
+            Content = new Border
+            {
+                CornerRadius = new CornerRadius(14), Background = Surface, BorderBrush = Theme.Stroke, BorderThickness = new Thickness(1),
+                Margin = new Thickness(14), Child = layout,
+                Effect = new DropShadowEffect { BlurRadius = 24, ShadowDepth = 6, Opacity = 0.4, Color = Colors.Black },
+            };
+            Loaded += delegate { Native.ForceForeground(new WindowInteropHelper(this).Handle); Activate(); };
+        }
+
+        // O ícone do programa (src\icone.ico, embutido no .exe pelo build.ps1; o maior tamanho vem primeiro).
+        static ImageSource AppIcon()
+        {
+            using (Stream s = Assembly.GetExecutingAssembly().GetManifestResourceStream("icone.ico"))
+                return s == null ? null : BitmapFrame.Create(s, BitmapCreateOptions.None, BitmapCacheOption.OnLoad);
+        }
+
+        UIElement TopBar()
+        {
+            var title = new TextBlock
+            {
+                Text = WindowTitle, Foreground = Theme.Muted, FontSize = 12.5, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(20, 0, 0, 0),
+            };
+            Border min = BarButton("", () => WindowState = WindowState.Minimized);
+            Border close = BarButton("", Close);
+            var bar = new DockPanel { Height = 46, Background = Brushes.Transparent, LastChildFill = false };
+            DockPanel.SetDock(close, Dock.Right);
+            DockPanel.SetDock(min, Dock.Right);
+            bar.Children.Add(title);
+            bar.Children.Add(close);
+            bar.Children.Add(min);
+            bar.MouseLeftButtonDown += delegate { try { DragMove(); } catch { } };
+            return bar;
+        }
+
+        static Border BarButton(string glyph, Action click)
+        {
+            var t = new TextBlock
+            {
+                Text = glyph, FontFamily = Theme.Icons, FontSize = 10, Foreground = Theme.Muted,
+                HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center,
+            };
+            var b = new Border { Width = 40, Height = 32, CornerRadius = new CornerRadius(8), Margin = new Thickness(0, 0, 6, 0), Background = Brushes.Transparent, Child = t };
+            b.MouseEnter += delegate { b.Background = Theme.Hover; t.Foreground = Theme.Text; };
+            b.MouseLeave += delegate { b.Background = Brushes.Transparent; t.Foreground = Theme.Muted; };
+            b.MouseLeftButtonDown += (s, e) => e.Handled = true; // não começa a arrastar a janela
+            b.MouseLeftButtonUp += delegate { click(); };
+            return b;
+        }
+
+        void AddNav(string key, string glyph, string text)
+        {
+            var sp = new StackPanel { Orientation = Orientation.Horizontal };
+            sp.Children.Add(new TextBlock { Text = glyph, FontFamily = Theme.Icons, FontSize = 15, Foreground = Theme.Text, Width = 30, VerticalAlignment = VerticalAlignment.Center });
+            sp.Children.Add(new TextBlock { Text = text, Foreground = Theme.Text, FontSize = 13.5, VerticalAlignment = VerticalAlignment.Center });
+            var b = new Border { CornerRadius = new CornerRadius(8), Padding = new Thickness(12, 9, 12, 9), Margin = new Thickness(0, 0, 0, 2), Child = sp, Cursor = Cursors.Hand, Tag = key, Background = Brushes.Transparent };
+            b.MouseEnter += delegate { if (current != key) b.Background = Theme.Hover; };
+            b.MouseLeave += delegate { if (current != key) b.Background = Brushes.Transparent; };
+            b.MouseLeftButtonUp += delegate { Show(key); };
+            nav.Children.Add(b);
+        }
+
+        void Show(string key)
+        {
+            current = key;
+            foreach (Border b in nav.Children.OfType<Border>()) b.Background = (string)b.Tag == key ? NavSelected : Brushes.Transparent;
+            page.Content = key == "geral" ? GeneralPage() : FoldersPage();
+        }
+
+        UIElement FoldersPage()
+        {
+            var sp = new StackPanel();
+            Button add = Theme.MakeButton("Nova pasta", true);
+            add.Click += delegate { NewFolder(); };
+            sp.Children.Add(Header("Pastas", add));
+            sp.Children.Add(Note("Um clique numa pasta da área de trabalho abre ela. Pra guardar um app, arraste o atalho pra cima da pasta."));
+            List<string> names = Store.Names();
+            if (names.Count == 0) sp.Children.Add(Note("Nenhuma pasta ainda. Clique em \"Nova pasta\" pra criar a primeira."));
+            foreach (string n in names) sp.Children.Add(FolderRow(n));
+            return sp;
+        }
+
+        UIElement FolderRow(string name)
+        {
+            FolderStyle style = FolderStyle.Load(name);
+            List<string> items = Store.Items(name);
+            List<BitmapSource> icons = items.Take(style.Preview * style.Preview).Select(p => IconUtil.Get(p)).Where(b => b != null).ToList();
+            var img = new Image { Source = IconUtil.RenderFolder(icons, 96, style), Width = 46, Height = 46, Margin = new Thickness(0, 0, 14, 0) };
+            RenderOptions.SetBitmapScalingMode(img, BitmapScalingMode.HighQuality);
+            var text = new StackPanel { VerticalAlignment = VerticalAlignment.Center };
+            text.Children.Add(new TextBlock { Text = name, Foreground = Theme.Text, FontSize = 14.5, FontWeight = FontWeights.SemiBold, TextTrimming = TextTrimming.CharacterEllipsis });
+            text.Children.Add(new TextBlock { Text = items.Count == 1 ? "1 app" : items.Count + " apps", Foreground = Theme.Muted, FontSize = 12 });
+
+            Button edit = Theme.MakeButton("Personalizar", false);
+            edit.Click += delegate { CustomizeDialog.Edit(this, name, Message); Show(current); };
+            Button del = Theme.MakeButton("Excluir", false);
+            del.Click += delegate
+            {
+                if (!Confirm("Excluir a pasta \"" + name + "\"?\nOs apps de dentro dela voltam pra área de trabalho.")) return;
+                Store.DeleteFolder(name);
+                Show(current);
+            };
+            edit.VerticalAlignment = del.VerticalAlignment = VerticalAlignment.Center;
+
+            var row = new DockPanel();
+            DockPanel.SetDock(img, Dock.Left);
+            DockPanel.SetDock(del, Dock.Right);
+            DockPanel.SetDock(edit, Dock.Right);
+            row.Children.Add(img);
+            row.Children.Add(del);
+            row.Children.Add(edit);
+            row.Children.Add(text);
+            return new Border { CornerRadius = new CornerRadius(12), Background = RowBackground, Padding = new Thickness(12, 10, 14, 10), Margin = new Thickness(0, 0, 0, 8), Child = row };
+        }
+
+        void NewFolder()
+        {
+            string n = InputDialog.Ask(this, "Nova pasta de apps", "Nova pasta", "Criar");
+            if (n == null) return;
+            Message(Store.CreateFolder(n));
+            Show(current);
+        }
+
+        UIElement GeneralPage()
+        {
+            var sp = new StackPanel();
+            sp.Children.Add(Header("Geral", null));
+            sp.Children.Add(Note("Opções que valem pra todas as pastas."));
+
+            sp.Children.Add(Row("Abrir com um clique",
+                "Desligado, as pastas abrem com dois cliques, como uma pasta comum.",
+                Theme.MakeToggle(Config.OneClick, on => { Config.OneClick = on; return on; })));
+            sp.Children.Add(Row("Iniciar com o Windows",
+                "Deixa o programa rodando em segundo plano desde que o PC liga. Ele é leve e é o que faz a pasta abrir com um clique.",
+                Theme.MakeToggle(Installer.Autostart, on => { Busy(() => Installer.SetAutostart(on)); return Installer.Autostart; })));
+            sp.Children.Add(Row("\"Nova pasta de apps\" no botão direito",
+                "Mostra a opção no menu do botão direito da área de trabalho (no Windows 11, fica em \"Mostrar mais opções\").",
+                Theme.MakeToggle(Store.MenuInstalled, on => { if (on) Store.InstallMenu(); else Store.UninstallMenu(); return Store.MenuInstalled; })));
+
+            bool running = Installer.ResidentRunning;
+            Button restart = Theme.MakeButton(running ? "Reiniciar" : "Iniciar", false);
+            restart.Click += delegate
+            {
+                Busy(() => { Installer.StopOthers(); Program.StartResident(); Thread.Sleep(800); });
+                Show(current);
+            };
+            sp.Children.Add(Row("Programa em segundo plano",
+                running ? "Rodando." : "Parado. As pastas ainda abrem com dois cliques, mas não com um.", restart));
+
+            Button uninstall = Theme.MakeButton("Desinstalar", false);
+            ((TextBlock)((Border)uninstall.Content).Child).Foreground = Danger;
+            uninstall.Click += delegate
+            {
+                if (!Confirm("Desinstalar o Foldy?\n\nAs pastas são removidas e os apps de dentro delas voltam pra área de trabalho.")) return;
+                if (!Busy(Installer.Uninstall)) return;
+                Message("Pronto, o Foldy foi desinstalado.");
+                Application.Current.Shutdown();
+            };
+            var danger = new TextBlock { Text = "Zona de perigo", Foreground = Theme.Muted, FontSize = 12, Margin = new Thickness(2, 16, 0, 8) };
+            sp.Children.Add(danger);
+            sp.Children.Add(Row("Desinstalar", "Remove o programa do PC. Os apps de dentro das pastas voltam pra área de trabalho, nada se perde.", uninstall));
+
+            Version v = Assembly.GetExecutingAssembly().GetName().Version;
+            sp.Children.Add(new TextBlock { Text = "Foldy " + v.ToString(2), Foreground = Theme.Muted, FontSize = 11.5, Margin = new Thickness(2, 14, 0, 0) });
+            return sp;
+        }
+
+        UIElement InstallPage()
+        {
+            bool update = Installer.HasInstall;
+            var sp = new StackPanel { HorizontalAlignment = HorizontalAlignment.Center, MaxWidth = 440, Margin = new Thickness(16, 24, 0, 0) };
+            var img = new Image { Source = AppIcon(), Width = 120, Height = 120, Margin = new Thickness(0, 0, 0, 18) };
+            RenderOptions.SetBitmapScalingMode(img, BitmapScalingMode.HighQuality);
+            sp.Children.Add(img);
+            sp.Children.Add(new TextBlock { Text = "Foldy", Foreground = Theme.Text, FontSize = 26, FontWeight = FontWeights.SemiBold, HorizontalAlignment = HorizontalAlignment.Center });
+            sp.Children.Add(new TextBlock
+            {
+                Text = "Pastas de apps na área de trabalho, iguais às do celular. Um clique abre a pasta, e é só arrastar os atalhos pra dentro ou pra fora.",
+                Foreground = Theme.Muted, FontSize = 13.5, TextWrapping = TextWrapping.Wrap, TextAlignment = TextAlignment.Center, Margin = new Thickness(0, 8, 0, 22),
+            });
+            Button install = Theme.MakeButton(update ? "Atualizar" : "Instalar", true);
+            install.HorizontalAlignment = HorizontalAlignment.Center;
+            install.Margin = new Thickness(0);
+            install.Click += delegate
+            {
+                bool ok = Busy(() =>
+                {
+                    Installer.CopyToInstallDir();
+                    using (Process p = Process.Start(Store.InstalledExe, "--instalar")) p.WaitForExit(60000);
+                    Process.Start(Store.InstalledExe, "--painel");
+                });
+                if (ok) Application.Current.Shutdown();
+            };
+            sp.Children.Add(install);
+            sp.Children.Add(new TextBlock
+            {
+                Text = update ? "Troca a versão instalada por esta. Suas pastas continuam como estão." : "Instala só pra sua conta, sem pedir senha de administrador.",
+                Foreground = Theme.Muted, FontSize = 11.5, HorizontalAlignment = HorizontalAlignment.Center, Margin = new Thickness(0, 12, 0, 0),
+            });
+            return sp;
+        }
+
+        static UIElement Header(string text, FrameworkElement right)
+        {
+            var d = new DockPanel { Margin = new Thickness(0, 2, 0, 6) };
+            if (right != null)
+            {
+                DockPanel.SetDock(right, Dock.Right);
+                right.VerticalAlignment = VerticalAlignment.Center;
+                d.Children.Add(right);
+            }
+            d.Children.Add(new TextBlock { Text = text, Foreground = Theme.Text, FontSize = 22, FontWeight = FontWeights.SemiBold });
+            return d;
+        }
+
+        static TextBlock Note(string text)
+        {
+            return new TextBlock { Text = text, Foreground = Theme.Muted, FontSize = 12.5, TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 0, 0, 14) };
+        }
+
+        static UIElement Row(string title, string description, FrameworkElement control)
+        {
+            control.VerticalAlignment = VerticalAlignment.Center;
+            control.Margin = new Thickness(18, 0, 0, 0);
+            var text = new StackPanel { VerticalAlignment = VerticalAlignment.Center };
+            text.Children.Add(new TextBlock { Text = title, Foreground = Theme.Text, FontSize = 14 });
+            text.Children.Add(new TextBlock { Text = description, Foreground = Theme.Muted, FontSize = 12, TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 2, 0, 0) });
+            var row = new DockPanel();
+            DockPanel.SetDock(control, Dock.Right);
+            row.Children.Add(control);
+            row.Children.Add(text);
+            return new Border { CornerRadius = new CornerRadius(12), Background = RowBackground, Padding = new Thickness(16, 12, 16, 12), Margin = new Thickness(0, 0, 0, 8), Child = row };
+        }
+
+        // Roda algo demorado com o cursor de espera; erro vira mensagem em vez de derrubar o painel.
+        bool Busy(Action action)
+        {
+            string err = null;
+            Mouse.OverrideCursor = Cursors.Wait;
+            try { action(); }
+            catch (Exception ex) { err = ex.Message; Log.Write("Painel: " + ex); }
+            finally { Mouse.OverrideCursor = null; }
+            if (err != null) Message("Não deu certo: " + err);
+            return err == null;
+        }
+
+        void Message(string text) { Theme.Message(this, text); }
+
+        bool Confirm(string text)
+        {
+            return MessageBox.Show(this, text, "Foldy", MessageBoxButton.YesNo, MessageBoxImage.Question) == MessageBoxResult.Yes;
+        }
+    }
+
     // Repassa o pedido pro residente sem carregar o WPF (é o que deixa o duplo clique e o
     // "soltar em cima da pasta" rápidos). Não pode usar nenhum tipo do WPF aqui.
     static class Client
@@ -1243,7 +2170,7 @@ namespace PastasDesktop
         {
             List<string> rest = args.SkipWhile(a => a == "--abrir").ToList();
             if (rest.Count == 0) return true;
-            IntPtr h = FindWindow(null, "PastasDesktopResidente");
+            IntPtr h = FindWindow(null, "FoldyResidente");
             if (h == IntPtr.Zero) return false;
             uint pid;
             GetWindowThreadProcessId(h, out pid);
@@ -1264,15 +2191,15 @@ namespace PastasDesktop
     {
         public static bool IsResident;
 
-        static void StartResident()
+        public static void StartResident()
         {
-            try { Process.Start(Store.Exe, "--residente"); } catch (Exception ex) { Log.Write("Iniciando residente: " + ex.Message); }
+            try { Process.Start(Store.InstalledExe, "--residente"); } catch (Exception ex) { Log.Write("Iniciando residente: " + ex.Message); }
         }
 
         [STAThread]
         static void Main(string[] args)
         {
-            string cmd = args.Length > 0 ? args[0] : "--residente";
+            string cmd = args.Length > 0 ? args[0] : "--painel";
             if (!cmd.StartsWith("--") || cmd == "--abrir")
             {
                 if (Client.TrySend(args)) return;
@@ -1294,11 +2221,26 @@ namespace PastasDesktop
                 e.Handled = true; // continua rodando
             };
 
-            string cmd = args.Length > 0 ? args[0] : "--residente";
+            // Sem argumentos (ex.: o .exe baixado aberto com dois cliques) abre o painel.
+            string cmd = args.Length > 0 ? args[0] : "--painel";
+            if (cmd == "--painel")
+            {
+                IntPtr open = Native.FindWindow(null, ControlPanel.WindowTitle);
+                if (open != IntPtr.Zero)
+                {
+                    Native.ShowWindow(open, 9 /* SW_RESTORE */);
+                    Native.ForceForeground(open);
+                    return;
+                }
+                if (Installer.IsInstalledCopy && !Installer.ResidentRunning) StartResident();
+                app.ShutdownMode = ShutdownMode.OnLastWindowClose;
+                app.Run(new ControlPanel());
+                return;
+            }
             if (cmd == "--residente")
             {
                 bool first;
-                var mutex = new Mutex(true, @"Local\PastasDesktopResidente", out first);
+                var mutex = new Mutex(true, @"Local\FoldyResidente", out first);
                 if (!first) return;
                 IsResident = true;
                 Log.Write("Residente iniciado.");
@@ -1314,8 +2256,8 @@ namespace PastasDesktop
                 StartResident();
                 return;
             }
-            if (cmd == "--instalar") { Store.InstallMenu(); return; }
-            if (cmd == "--desinstalar") { Store.UninstallMenu(); return; }
+            if (cmd == "--instalar") { Installer.Setup(); return; }
+            if (cmd == "--desinstalar") { Installer.Uninstall(); return; }
 
             // Duplo clique, Enter, ou arquivos soltos em cima do ícone da pasta.
             List<string> rest = args.SkipWhile(a => a == "--abrir").ToList();
